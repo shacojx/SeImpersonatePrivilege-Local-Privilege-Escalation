@@ -15,7 +15,7 @@ public class TokenUtil {
 "@
 Add-Type -TypeDefinition $duplicateTokenSource
 
-# --- Nhúng mã C# để sử dụng CreateProcessWithTokenW ---
+# --- Nhúng mã C# để sử dụng CreateProcessAsUserW ---
 $createProcessSource = @"
 using System;
 using System.Runtime.InteropServices;
@@ -49,72 +49,62 @@ public class ProcessUtil {
         public int dwThreadId;
     }
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern bool CreateProcessWithTokenW(
+    public static extern bool CreateProcessAsUserW(
         IntPtr hToken,
-        uint dwLogonFlags,
         string lpApplicationName,
         string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
         uint dwCreationFlags,
         IntPtr lpEnvironment,
         string lpCurrentDirectory,
         ref STARTUPINFO lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
+    
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(
+        IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
 }
 "@
 Add-Type -TypeDefinition $createProcessSource
 
-# --- Nhúng mã C# để dùng OpenThreadToken ---
-$openTokenSource = @"
-using System;
-using System.Runtime.InteropServices;
-public class TokenOpener {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetCurrentThread();
-    [DllImport("advapi32.dll", SetLastError = true)]
-    public static extern bool OpenThreadToken(
-        IntPtr ThreadHandle,
-        uint DesiredAccess,
-        bool OpenAsSelf,
-        out IntPtr TokenHandle);
-}
-"@
-Add-Type -TypeDefinition $openTokenSource
-
-# --- Bước 1: Lấy token của thread hiện tại ---
+# --- Mở token của tiến trình hiện tại ---
 $TOKEN_ALL_ACCESS = 0xF01FF
-$SecurityImpersonation = 2   # SECURITY_IMPERSONATION_LEVEL.SecurityImpersonation
-$TokenPrimary = 1           # TokenPrimary
-
-$hCurrentThread = [TokenOpener]::GetCurrentThread()
 $hToken = [IntPtr]::Zero
-if (-not [TokenOpener]::OpenThreadToken($hCurrentThread, $TOKEN_ALL_ACCESS, $false, [ref] $hToken)) {
-    Write-Error "OpenThreadToken failed. Error: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+
+$processHandle = [System.Diagnostics.Process]::GetCurrentProcess().Handle
+if (![ProcessUtil]::OpenProcessToken($processHandle, $TOKEN_ALL_ACCESS, [ref] $hToken)) {
+    $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    Write-Error "OpenProcessToken failed with error: $err"
     exit
 }
-Write-Output "[*] Opened thread token: $hToken"
+Write-Output "[*] Opened process token: $hToken"
 
-# --- Bước 2: Dùng DuplicateTokenEx để nhân bản token ---
+# --- Duplicate token ---
 $hDupToken = [IntPtr]::Zero
-if ([TokenUtil]::DuplicateTokenEx($hToken, $TOKEN_ALL_ACCESS, [IntPtr]::Zero, $SecurityImpersonation, $TokenPrimary, [ref] $hDupToken)) {
+if ([TokenUtil]::DuplicateTokenEx($hToken, $TOKEN_ALL_ACCESS, [IntPtr]::Zero, 2, 1, [ref] $hDupToken)) {
     Write-Output "[*] DuplicateTokenEx succeeded. Duplicated token: $hDupToken"
-    $systemToken = $hDupToken
 } else {
     $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
     Write-Error "DuplicateTokenEx failed with error: $err"
     exit
 }
 
-# --- Bước 3: Sử dụng CreateProcessWithTokenW để tạo process mới (cmd.exe) ---
+# --- Tạo process mới với CreateProcessAsUserW ---
 $si = New-Object ProcessUtil+STARTUPINFO
 $si.cb = [Runtime.InteropServices.Marshal]::SizeOf($si)
+$si.lpDesktop = "winsta0\\default"  # Cần để đảm bảo cửa sổ hiển thị đúng
 $pi = New-Object ProcessUtil+PROCESS_INFORMATION
 
-$cmdPath = "C:\Windows\System32\cmd.exe"
-Write-Output "[*] Creating process with token. Command: $cmdPath"
-$result = [ProcessUtil]::CreateProcessWithTokenW($systemToken, 0, $null, $cmdPath, 0, [IntPtr]::Zero, $null, [ref] $si, [ref] $pi)
+$cmdPath = "C:\\Windows\\System32\\cmd.exe"
+$cmdLine = "/k echo Hello"
+
+Write-Output "[*] Creating process with token. Command: $cmdLine"
+$result = [ProcessUtil]::CreateProcessAsUserW($hDupToken, $cmdPath, $cmdLine, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0, [IntPtr]::Zero, $null, [ref] $si, [ref] $pi)
 if ($result) {
     Write-Output "[+] Process created successfully. PID: $($pi.dwProcessId)"
 } else {
     $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-    Write-Error "CreateProcessWithTokenW failed with error: $err"
+    Write-Error "CreateProcessAsUserW failed with error: $err"
 }
