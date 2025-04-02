@@ -6,3 +6,6 @@
 ## Vulnerability Details
 
 - From LOCAL/NETWORK SERVICE to SYSTEM by abusing SeImpersonatePrivilege
+
+## Run poc
+powershell.exe -ExecutionPolicy Bypass -File poc.ps1
